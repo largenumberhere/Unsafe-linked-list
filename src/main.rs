@@ -13,7 +13,7 @@ fn main() {
 
     ll4::testing::add();
     ll4::testing::add2();
-    println!("strings");
+    //println!("strings");
     ll4::testing::add_strings();
     ll4::testing::first();
     ll4::testing::get();

@@ -52,20 +52,21 @@ impl<T> LinkedList<T> {
         }
 
         unsafe {
-
+            // Find the last node
             let last_node = {
                 let mut last_node: *mut LLNode<T> = self.head;
+                assert!(!last_node.is_null(), "This should never be null! The method should have returned early if self.head is null");
                 loop {
-                    let node_value_before = ManuallyDrop::new(last_node.read());
-                    if node_value_before.next.is_null() {
+                    if (*last_node).next.is_null() {
                         break;
                     }
-                    let node_value = ManuallyDrop::new(last_node.read());
-                    last_node = node_value.next;
+                    last_node =(*last_node).next;
                 }
+
                 last_node
             };
 
+            // Add the new node to the end of the last node
             (*last_node).next = allocation;
             self.tail = (*last_node).next;
         }
@@ -183,7 +184,7 @@ pub mod testing {
             let mut ll = LinkedList::new();
             for i in 0..16 {
                 let string = format!("item-{}", i);
-                println!("{:p}", string.as_ptr());
+                //println!("{:p}", string.as_ptr());
                 ll.push_back(string);
             }
 
