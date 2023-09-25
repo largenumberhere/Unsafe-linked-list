@@ -1,0 +1,6 @@
+[env]
+RUSTFLAGS="-Zsanitizer=address"
+#MIRIFLAGS="-Zmiri-backtrace=full"
+# MIRIFLAGS=-Zmiri-disable-stacked-borrows --- "basically non-experimental mode of miri" -saethlin discord
+
+
