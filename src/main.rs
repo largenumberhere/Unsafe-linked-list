@@ -6,7 +6,9 @@ extern crate core;
 //mod ll3;
 mod ll4;
 
-/// test for memory bugs with: `cargo miri run`
+/// test for memory bugs with: `cargo miri run`.
+///  Does not use the integrated rust test suite
+///  because it makes memory bug testing much more difficult.
 fn main() {
 
     ll4::testing::add();
