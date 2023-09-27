@@ -17,4 +17,7 @@ fn main() {
     ll4::testing::add_strings();
     ll4::testing::first();
     ll4::testing::get();
+    ll4::testing::create_destroy();
+    ll4::testing::into_iter();
+    ll4::testing::into_iter_partial_use();
 }

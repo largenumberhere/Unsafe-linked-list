@@ -1,17 +1,23 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::env::current_exe;
+use std::fmt::{Debug, Display, Formatter};
 use std::mem::{align_of, ManuallyDrop, size_of};
-use std::ptr::{addr_of_mut, null_mut};
+use std::ops::Deref;
+use std::ptr::{addr_of_mut, NonNull, null_mut};
+use std::thread::current;
 
 struct LinkedList<T> {
     head: *mut LLNode<T>,
     tail: *mut LLNode<T>
 }
 
+#[derive(Clone)]
 struct LLNode<T> {
     //last: *mut LLNode<T>,
     next: *mut LLNode<T>,
     value: T 
 }
+
 
 
 impl<T> LinkedList<T> {
@@ -159,82 +165,213 @@ impl<T> LinkedList<T> {
         let value = &node.value;
         Some(value)
     }
-}
 
-impl<T> Drop for LinkedList<T> {
-    fn drop(&mut self) {
-
+    /// Get pointer to the first item and remove it from the linked list if it is not null.
+    /// you must manually deallocate the memory at this location after use with the layout given by this structs layout method.
+    /// Using the wrong layout can cause undefined behaviour.
+    /// Not deallocating will cause memory leaks.
+    /// All pointers to the former head value will become invalidated.
+    unsafe fn yank_first(&mut self) -> Option<*mut LLNode<T>> {
         if self.head.is_null(){
-            return;
+            return None;
         }
+        /*
+        Safety:
+            - we know self.head is not null on previous line
+            - we know that self.head is otherwise aligned and valid because aligned and allocated
+              or null_mut are the only 2 pointer states we create for head
+        */
+        let next = (*self.head).next;
+        let head = self.head;
 
+        self.head = next;
+        return Some(head);
+    }
+
+    /// Drop all the nodes contained in this Linked list without moving ownership.
+    /// Invalidates all pointers/ references to nodes that were in this linkedlist.
+    ///
+    unsafe fn drop_inner(&mut self){
         let layout = self.layout();
-        // Dealocate nodes until there are none left
+
+        let mut current = self.head;
+        // Deallocate nodes front to back, until there are none left
         loop {
-            let mut last = self.head;
-            let mut node = self.head;
             unsafe {
-
-                // Traverse nodes until the last 2 are found
-                /*
-                Safety:
-                    - We know that node is not null because we guarded against that earlier
-                    - We know the node will otherwise be an aligned region of valid memory because we correctly allocated it earlier
-                    - We know that node.next can only be `null_mut()` or valid node
-                 */
-                loop{
-                    if (*node).next.is_null(){
-                        break;
-                    }
-                    last = node;
-                    node = (*node).next;
+                if current.is_null() {
+                    return;
                 }
-
-                // Call T's destructor
                 /*
                 Safety:
-                    - We known the memory is valid for writing and reading because we allocated it earlier.
-                    - We know the memory is aligned because self.layout specifies an alignment
+                    - We know current is not null,
+                    - We know current is aligned because we allocated it with valid layout
+                    - We know that current can only be null_mut() (which is caught by the the guard clause before this) or a
+                        valid pointer because it is initialized to null and the only state we set it to is pointing to a valid node.
+                 */
+                let next_ptr = (*current).next;
+
+                /*
+                Safety:
+                    - We known the memory is valid for writing and reading because we allocated it earlier and haven't yet dealocated it
+                    - We know the memory is aligned because self.layout specifies an checked alignment
                     - We know it's not null because we stop just before a null node above
                     - We know node is valid for dropping because we have not dropped it before and do not provide mutable access to it
                     - Node is not being accessed while it is being dropped because the destructor must only be called once and there is no reference allowed to self while or after drop
                     - Node's drop only drops T, it value is not used after drop is called
                  */
-                node.drop_in_place();
-
-                // node's drop method only frees T, not the region of memory the node occupies, so we must manually deallocate
-                // Deallocate the node and remove the pointer to it (or its next pointer if it is the last)
+                current.drop_in_place();
 
                 /*
                 Safety:
-                    - We know from iteration above that node points to a valid, aligned node.
-                    - We know that last.next is the only valid pointer/reference to last, because we only create one in this way and you cannot hold references to a dropped value.
+                    - We know that current is not null as checked above and the only value we set is a node
+                    - We know that current was created with the same valid layout - self.layout
+                    - We know that current is created with the same allocator
                  */
-                (*last).next = null_mut();
-                if node == self.head{
-                    /*
-                    Safety:
-                        - We know we allocated this memory earlier with the same allocator
-                        - We know from the guard clause above that self.head is not null and points to a node
-                        - We know that layout is a valid, non-zero layout that is the same as the one used to allocate earlier
-                     */
-                    dealloc(self.head as *mut u8, layout);
-                    self.head = null_mut();
-                    return;
-                }
+                dealloc(current as *mut u8, layout);
 
-                /*
-                Safety:
-                    - We know that node is not null as per iteration above and points to a node
-                    - We know that node was created with the same layout - self.layout
-                    - We know that node is created with the same allocator
-                 */
-                dealloc(node as *mut u8, layout);
+                current = next_ptr;
             }
         }
-
     }
 }
+
+impl<T> Drop for LinkedList<T> {
+    fn drop(&mut self) {
+        /*
+        Safety:
+            - All references to LinkedList or its nodes are now unable to be held, doing so would violate lifetime rules.
+            - No raw pointers are made externally available to the nodes and we do not use them after calling drop
+        */
+        unsafe{ self.drop_inner()};
+    }
+}
+
+struct IntoIter<T>
+{
+    linked_list : ManuallyDrop<LinkedList<T>>,
+    layout: Layout
+}
+
+/// basically a crude reinvention of Box<LLNode<T>>
+struct LinkedListItem<T>
+{
+    heap_allocated_node : *mut LLNode<T>,
+    layout: Layout,
+}
+
+impl<T> Drop for LinkedListItem<T> {
+    fn drop(&mut self) {
+        unsafe {
+            /*
+            Safety:
+                - We allocated this memory earlier so we know it is valid for reads and writes
+                - We used a validated layout so we know it's aligned
+                - We did not create a null LinkedListItem, so we know it can't be null
+                - We assume the library consumer is use safe code,
+                   and thus holds no pointer to the values contained in T
+                - We do not allow references or pointers to the nodes after drop_in_place is called,
+                   so no pointers can become invalidated.
+            */
+            self.heap_allocated_node.drop_in_place();
+
+            /*
+            Safety:
+                - We know this memory is allocated with this allocator because we did so earlier.
+                - We know this is the same valid layout we used to allocate this region of memory
+            */
+            dealloc(self.heap_allocated_node as *mut u8, self.layout);
+        }
+    }
+}
+
+impl<T> LinkedListItem<T> {
+    fn value(&self) -> &T {
+        /*
+        Safety:
+            - We know self.heap_allocated_node is not null, because the next method which crates
+               this only does so if `yank_first` succeeds. It does not construct this struct if the node is null.
+            - We know self.heap_allocated_node uses a valid layout because all non-null nodes are allocated with a validated layout.
+        */
+        let val = & unsafe{ &*self.heap_allocated_node }.value ;
+        val
+    }
+}
+
+impl<T> Deref for LinkedListItem<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.value()
+    }
+
+}
+
+impl<T> Debug for LinkedListItem<T> where T: Debug {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(self.value(), f)
+    }
+}
+
+impl<T> Display for LinkedListItem<T>  where T: Display {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+       Display::fmt(self.value(),f)
+    }
+}
+
+
+
+
+impl<T> Iterator for IntoIter<T>
+{
+    type Item = LinkedListItem<T>;
+    fn next(&mut self) -> Option<Self::Item>{
+        // Remove first node
+        /*
+        Safety:
+            - We immediately wrap the data in a struct that deallocates with the correct layout on drop,
+               so no memory leaks should occur.
+            - No references are allowed to any nodes after into_iterator is called, so this will not invalidate any refernces.
+            - No public facing are given so they cannot be invalidated.
+        */
+        let node = unsafe {self.linked_list.yank_first()}?;
+
+        // Place it in a struct that only allows access to the item and deallocates on drop
+        let item = LinkedListItem {
+            heap_allocated_node: node,
+            layout: self.layout
+        };
+
+        Some(item)
+    }
+}
+
+
+impl<T> IntoIterator for LinkedList<T>
+{
+    type Item = LinkedListItem<T>;
+    type IntoIter = IntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        // Do not drop nodes until we say
+        let nodes = ManuallyDrop::new(self);
+        IntoIter {
+            layout: nodes.layout(),
+            linked_list: nodes,
+        }
+    }
+}
+
+impl<T> Drop for IntoIter<T> {
+    fn drop(&mut self) {
+        /*
+        Safety:
+            - No references are allowed to a struct after drop is called to is, so the user cannot hold stale references.
+            - No public facing pointer access is available, so they cannot be stale pointers.
+        */
+        unsafe{ self.linked_list.drop_inner();}
+    }
+}
+
+
+
 
 
 //#[cfg(test)]
@@ -309,8 +446,37 @@ pub mod testing {
                 assert_eq!(ll.get(i + i3), None);
             }
         }
-
     }
+
+    pub fn create_destroy() {
+        let ll: LinkedList<String> = LinkedList::new();
+        std::mem::drop(ll);
+    }
+
+    pub fn into_iter() {
+        let mut ll = LinkedList::new();
+        ll.push_back("Hello".to_string());
+        ll.push_back("World".to_string());
+
+        let iterator = ll.into_iter();
+        for string in iterator{
+            println!("{}", *string);
+        }
+    }
+
+    pub fn into_iter_partial_use() {
+        let mut ll = LinkedList::new();
+        for i in 0..128{
+            ll.push_back(format!("hello! {}", i));
+        }
+
+        let mut iterator = ll.into_iter();
+        for i in 0..64 {
+            assert_eq!(iterator.next().as_deref(), Some(format!("hello! {}", i)).as_ref());
+        }
+    }
+
+
 
 
 
